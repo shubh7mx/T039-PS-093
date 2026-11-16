@@ -1,0 +1,6 @@
+{
+  "name": "League Competition Engine",
+  "description": "Command-file driven sports league competition engine for double round-robin scheduling, results, tie-breakers, rescheduling, and playoff seeding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
