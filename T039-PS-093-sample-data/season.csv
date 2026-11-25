@@ -1,0 +1,11 @@
+parameter,value
+season_start,2026-09-04
+overs_per_innings,20
+max_matches_per_day,2
+slot_single,19:30
+slots_double,15:30;19:30
+min_clear_days,2
+min_clear_days_long_travel,3
+long_travel_km_above,1500
+reserve_days_after_last_round,3
+qualifiers,4

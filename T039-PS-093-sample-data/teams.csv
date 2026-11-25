@@ -1,0 +1,11 @@
+team_id,team_name,home_venue_id,city
+T01-MUM,Mumbai Mavericks,VEN-01,Mumbai
+T02-MSW,Mumbai Swords,VEN-02,Mumbai
+T03-CHE,Chennai Cheetahs,VEN-03,Chennai
+T04-BLR,Bengaluru Bulls,VEN-04,Bengaluru
+T05-DEL,Delhi Dragons,VEN-06,Delhi
+T06-KOL,Kolkata Kings,VEN-05,Kolkata
+T07-HYD,Hyderabad Hawks,VEN-07,Hyderabad
+T08-DDY,Delhi Dynamos,VEN-06,Delhi
+T09-JAI,Jaipur Jaguars,VEN-08,Jaipur
+T10-AHM,Ahmedabad Arrows,VEN-09,Ahmedabad

@@ -1,525 +1,471 @@
-import shlex
+"""Command-file dispatcher for the league engine."""
+
+from __future__ import annotations
+
 from datetime import date, timedelta
-from typing import Optional
-from data_types import (
+from pathlib import Path
+
+from loaders import LeagueData, load_data, write_fixtures, write_points_table, write_qualification, write_result_log
+from models import (
     Fixture,
     MatchResult,
     MatchStatus,
-    PenaltyOffence,
+    Penalty,
     PlayoffMatch,
-    SeasonConfig,
-    StandingsRow,
-    Team,
-    Venue,
+    ResultLogRow,
+    Standing,
+    Withdrawal,
 )
-from make_schedule import assign_start_times, generate_schedule, reschedule_postponed_fixture
-from playoffs import build_playoff_bracket, record_playoff_outcome
-from points_table import compute_standings
-from run_rate import overs_to_balls
-
-
-# parse date
-def _parse_date(text: str) -> date:
-    return date.fromisoformat(text.strip())
-
-
-# expand dates
-def _parse_dates(spec: str) -> set[date]:
-    out: set[date] = set()
-    for part in spec.split(","):
-        item = part.strip()
-        if not item:
-            continue
-        if ".." in item:
-            start_s, end_s = item.split("..", 1)
-            d1 = _parse_date(start_s)
-            d2 = _parse_date(end_s)
-            cur = d1
-            while cur <= d2:
-                out.add(cur)
-                cur += timedelta(days=1)
-        else:
-            out.add(_parse_date(item))
-    return out
-
-
-# parse bool
-def _parse_bool(val: str) -> bool:
-    return val.strip().lower() in ("true", "1", "yes", "y")
-
-
-# split args
-def _split_kv(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
-    pos: list[str] = []
-    kv: dict[str, str] = {}
-    for tok in tokens:
-        if "=" in tok:
-            k, v = tok.split("=", 1)
-            kv[k.strip().lower()] = v.strip()
-        else:
-            pos.append(tok)
-    return pos, kv
+from playoffs import bracket_lines, build_bracket, qualification_rows, record_playoff_result
+from scheduler import audit_fixtures, generate_fixtures, reschedule_fixture
+from standings import compute_standings, overs_to_balls
 
 
 class LeagueEngine:
-    def __init__(self) -> None:
-        self.venues: dict[str, Venue] = {}
-        self.teams: dict[str, Team] = {}
-        self.distances: dict[tuple[str, str], float] = {}
-        self.season = SeasonConfig()
+    def __init__(self, data_dir: str | Path, output_dir: str | Path = ".") -> None:
+        self.data_dir = Path(data_dir)
+        self.output_dir = Path(output_dir)
+        self.data: LeagueData = load_data(self.data_dir)
         self.fixtures: list[Fixture] = []
-        self.penalties: list[PenaltyOffence] = []
-        self.bracket: Optional[dict[str, PlayoffMatch]] = None
-        self.qualifiers: list[StandingsRow] = []
-        self.current_date: Optional[date] = None
-        self.orig_round_end: dict[int, date] = {}
-        self.orig_last_round_end: Optional[date] = None
-        self.unsatisfied_constraints: list[str] = []
+        self.fixtures_by_id: dict[str, Fixture] = {}
+        self.round_end: dict[int, date] = {}
+        self.current_round = 0
+        self.penalties: list[Penalty] = []
+        self.withdrawals: list[Withdrawal] = []
+        self.result_log: list[ResultLogRow] = []
+        self.bracket: dict[str, PlayoffMatch] | None = None
+        self.final_table: list[Standing] = []
+        self.closed = False
+        self.outputs: list[str] = []
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # run file
-    def run_file(self, path: str) -> list[str]:
-        with open(path, "r", encoding="utf-8") as fh:
-            return self.run_lines(fh.readlines())
+    @property
+    def last_round_end(self) -> date:
+        if not self.round_end:
+            raise ValueError("No fixture list has been loaded or generated")
+        return max(self.round_end.values())
 
-    # run lines
+    @property
+    def league_cutoff(self) -> date:
+        return self.last_round_end + timedelta(days=self.data.season.reserve_days)
+
+    def run_file(self, path: str | Path) -> list[str]:
+        with Path(path).open(encoding="utf-8") as handle:
+            return self.run_lines(handle.readlines())
+
     def run_lines(self, lines: list[str]) -> list[str]:
-        outputs: list[str] = []
-        for line_no, raw in enumerate(lines, start=1):
-            stripped = raw.strip()
-            if not stripped or stripped.startswith("#"):
+        self.outputs = []
+        for line_number, raw_line in enumerate(lines, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
                 continue
-            out = self.execute_line(stripped, line_no)
-            if out:
-                outputs.extend(out)
-        return outputs
+            try:
+                self.execute(line.split("|"))
+            except Exception as error:
+                raise ValueError(f"Line {line_number}: {error}") from error
+        self._write_result_log()
+        return self.outputs
 
-    # run command
-    def execute_line(self, line: str, line_no: int = 0) -> list[str]:
-        tokens = shlex.split(line)
-        if not tokens:
-            return []
-        cmd = tokens[0].upper()
-        rest = tokens[1:]
-        pos, kv = _split_kv(rest)
-        out: list[str] = []
-
-        if cmd == "VENUE":
-            vid = pos[0]
-            city = pos[1]
-            cap = int(pos[2])
-            avail = _parse_dates(kv["available"]) if "available" in kv else None
-            black = _parse_dates(kv["blackout"]) if "blackout" in kv else set()
-            self.venues[vid] = Venue(venue_id=vid, city=city, capacity=cap, available_dates=avail, blackout_dates=black)
-
-        elif cmd == "VENUE_BLACKOUT":
-            vid = pos[0]
-            for item in pos[1:]:
-                self.venues[vid].blackout_dates.update(_parse_dates(item))
-
-        elif cmd == "VENUE_AVAILABLE":
-            vid = pos[0]
-            dates_set: set[date] = set()
-            for item in pos[1:]:
-                dates_set.update(_parse_dates(item))
-            if self.venues[vid].available_dates is None:
-                self.venues[vid].available_dates = dates_set
-            else:
-                self.venues[vid].available_dates.update(dates_set)
-
-        elif cmd == "TEAM":
-            tid, name, home_vid, city = pos[0], pos[1], pos[2], pos[3]
-            if home_vid not in self.venues:
-                raise ValueError(f"Line {line_no}: Unknown venue {home_vid}")
-            self.teams[tid] = Team(team_id=tid, name=name, home_venue_id=home_vid, city=city)
-
-        elif cmd == "DISTANCE":
-            c1, c2, km = pos[0], pos[1], float(pos[2])
-            self.distances[(c1, c2)] = km
-            self.distances[(c2, c1)] = km
-
-        elif cmd == "SEASON":
-            if "start" in kv:
-                self.season.start_date = _parse_date(kv["start"])
-            if "blackout" in kv:
-                self.season.blackout_dates.update(_parse_dates(kv["blackout"]))
-            if "windows" in kv:
-                self.season.broadcast_windows = [w.strip() for w in kv["windows"].split(",") if w.strip()]
-            if "overs" in kv:
-                self.season.overs_per_innings = int(kv["overs"])
-            if "reserve_days" in kv:
-                self.season.reserve_days = int(kv["reserve_days"])
-
-        elif cmd == "SEASON_START":
-            self.season.start_date = _parse_date(pos[0])
-
-        elif cmd == "BLACKOUT":
-            for item in pos:
-                self.season.blackout_dates.update(_parse_dates(item))
-
-        elif cmd == "BROADCAST_WINDOWS":
-            self.season.broadcast_windows = list(pos)
-
-        elif cmd == "SET_DATE":
-            self.current_date = _parse_date(pos[0])
-
-        elif cmd == "GENERATE_FIXTURES":
-            self.fixtures, self.unsatisfied_constraints = generate_schedule(
-                self.teams, self.venues, self.distances, self.season
-            )
-            self.orig_round_end = {}
-            for f in self.fixtures:
-                prev = self.orig_round_end.get(f.round_no)
-                if prev is None or f.match_date > prev:
-                    self.orig_round_end[f.round_no] = f.match_date
-            self.orig_last_round_end = max(self.orig_round_end.values()) if self.orig_round_end else None
-            out.append(f"Generated {len(self.fixtures)} fixtures across {len(self.orig_round_end)} rounds.")
-            if self.unsatisfied_constraints:
-                out.extend(self.unsatisfied_constraints)
-            else:
-                out.append("All scheduling constraints satisfied.")
-
-        elif cmd in ("RESULT", "RECORD_RESULT"):
-            out.append(self._handle_result(pos, kv))
-
-        elif cmd in ("SLOW_OVER_RATE", "PENALTY"):
-            tid = pos[0]
-            rnd = int(pos[1])
-            out.append(self._handle_penalty(tid, rnd))
-
-        elif cmd in ("WITHDRAW", "WITHDRAW_TEAM"):
-            tid = pos[0]
-            out.append(self._handle_withdraw(tid))
-
-        elif cmd == "PLAYOFF_RESULT":
-            out.append(self._handle_playoff_result(pos, kv))
-
-        elif cmd == "PRINT_FIXTURES":
-            rnd_filter = int(kv["round"]) if "round" in kv else None
-            team_filter = kv.get("team")
-            out.extend(self.format_fixtures(round_no=rnd_filter, team_id=team_filter))
-
-        elif cmd == "PRINT_TABLE":
-            rnd_filter = int(kv["round"]) if "round" in kv else (int(pos[0]) if pos else None)
-            out.extend(self.format_table(up_to_round=rnd_filter))
-
-        elif cmd == "PRINT_QUALIFICATION":
-            out.extend(self.format_qualification())
-
+    def execute(self, fields: list[str]) -> None:
+        command = fields[0].strip().upper()
+        args = [field.strip() for field in fields[1:]]
+        if command == "GENERATE_FIXTURES":
+            self._generate(args[0] if args and args[0] else None)
+        elif command == "CHECK_FIXTURES":
+            self._check_fixtures()
+        elif command == "LOAD_FIXTURES":
+            self._load_fixtures(args[0])
+        elif command == "RECORD_RESULT":
+            self._record_result(args[0])
+        elif command == "OVER_RATE_OFFENCE":
+            self._record_offence(args[0])
+        elif command == "WITHDRAW_TEAM":
+            self._withdraw(args[0], date.fromisoformat(args[1]))
+        elif command == "END_ROUND":
+            self.current_round = int(args[0])
+            self.outputs.append(f"END_ROUND {self.current_round}")
+        elif command == "PRINT_TABLE":
+            self._print_table(int(args[0]))
+        elif command == "CLOSE_LEAGUE_STAGE":
+            self._close_league()
+        elif command == "PRINT_QUALIFICATION":
+            self._print_qualification()
+        elif command == "PRINT_FIXTURES":
+            self._print_fixtures(args[0] if args and args[0] else None)
+        elif command == "PLAYOFF_RESULT":
+            self._record_playoff_result(args)
         else:
-            raise ValueError(f"Line {line_no}: Unknown command {cmd}")
+            raise ValueError(f"unknown command {command}")
 
-        return out
+    def _set_fixtures(self, fixtures: list[Fixture]) -> None:
+        self.fixtures = sorted(fixtures, key=lambda item: item.fixture_id)
+        self.fixtures_by_id = {fixture.fixture_id: fixture for fixture in self.fixtures}
+        self.round_end = {}
+        for fixture in self.fixtures:
+            self.round_end[fixture.round_no] = max(
+                self.round_end.get(fixture.round_no, fixture.original_date), fixture.original_date
+            )
 
-    # record result
-    def _handle_result(self, pos: list[str], kv: dict[str, str]) -> str:
-        fix_id = pos[0]
-        res_date = _parse_date(pos[1])
-        status_str = pos[2].upper()
+    def _generate(self, start_text: str | None) -> None:
+        if start_text:
+            self.data.season.start_date = date.fromisoformat(start_text)
+        fixtures, issues = generate_fixtures(
+            self.data.teams,
+            self.data.venues,
+            self.data.league_blackouts,
+            self.data.season,
+            self.data.distances,
+        )
+        self._set_fixtures(fixtures)
+        write_fixtures(self.output_dir / "generated_fixtures.csv", fixtures)
+        self.outputs.append(
+            f"Generated {len(fixtures)} fixtures across {len(self.round_end)} rounds"
+        )
+        self.outputs.extend(issues)
 
-        fix = next((f for f in self.fixtures if f.fixture_id == fix_id), None)
-        if fix is None:
-            return f"REJECTED: Unknown fixture {fix_id}"
-        if fix.expunged or fix.status == MatchStatus.CANCELLED:
-            return f"REJECTED: Fixture {fix_id} is cancelled or expunged"
-        if fix.status not in (MatchStatus.SCHEDULED, MatchStatus.POSTPONED):
-            return f"REJECTED: Duplicate result for fixture {fix_id} (already {fix.status.value})"
-        if res_date != fix.match_date:
-            return f"REJECTED: Fixture {fix_id} is not scheduled on {res_date.isoformat()} (scheduled {fix.match_date.isoformat()})"
+    def _load_fixtures(self, filename: str) -> None:
+        path = Path(filename)
+        if not path.is_absolute():
+            candidate = self.data_dir / filename
+            path = candidate if candidate.exists() else Path(filename)
+        import csv
 
-        entry_date = _parse_date(kv["entered_on"]) if "entered_on" in kv else self.current_date
-        if entry_date is not None and entry_date < fix.match_date:
-            return f"REJECTED: Result entered on {entry_date.isoformat()} before fixture date {fix.match_date.isoformat()}"
+        loaded: list[Fixture] = []
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                loaded.append(
+                    Fixture(
+                        fixture_id=row["fixture_id"],
+                        round_no=int(row["round"]),
+                        match_date=date.fromisoformat(row["match_date"]),
+                        start_time=row["start_time"],
+                        home_team_id=row["home_team_id"],
+                        away_team_id=row["away_team_id"],
+                        venue_id=row["venue_id"],
+                    )
+                )
+        self._set_fixtures(loaded)
+        self.outputs.append(f"Loaded {len(loaded)} fixtures from {filename}")
+
+    def _check_fixtures(self) -> None:
+        issues = audit_fixtures(
+            self.fixtures,
+            self.data.teams,
+            self.data.venues,
+            self.data.league_blackouts,
+            self.data.season,
+            self.data.distances,
+        )
+        if issues:
+            self.outputs.extend(issues)
+        else:
+            self.outputs.append("All fixture constraints satisfied")
+
+    def _reject(self, result_id: str, fixture_id: str, reason: str) -> None:
+        self.result_log.append(
+            ResultLogRow(result_id=result_id, fixture_id=fixture_id, action="REJECTED", reason=reason)
+        )
+        self.outputs.append(f"REJECTED {result_id}: {reason}")
+
+    def _record_result(self, result_id: str) -> None:
+        row = self.data.results.get(result_id)
+        if row is None:
+            self._reject(result_id, "", f"unknown result ID {result_id}")
+            return
+        fixture = self.fixtures_by_id.get(row.fixture_id)
+        if fixture is None:
+            self._reject(result_id, row.fixture_id, f"unknown fixture {row.fixture_id}")
+            return
+        if fixture.expunged or fixture.status in (MatchStatus.CANCELLED, MatchStatus.WALKOVER):
+            self._reject(result_id, row.fixture_id, "fixture is cancelled, expunged, or already a walkover")
+            return
+        if fixture.result is not None and fixture.status not in (MatchStatus.POSTPONED,):
+            self._reject(result_id, row.fixture_id, "a result has already been recorded")
+            return
+        if row.match_date != fixture.match_date:
+            self._reject(
+                result_id,
+                row.fixture_id,
+                f"fixture is scheduled on {fixture.match_date}, received {row.match_date}",
+            )
+            return
+        if row.match_date > self.league_cutoff:
+            self._reject(result_id, row.fixture_id, "result is after the last reserve day")
+            return
 
         try:
-            status = MatchStatus(status_str)
+            status = MatchStatus(row.status)
         except ValueError:
-            return f"REJECTED: Invalid status {status_str}"
-
-        allotted = int(kv.get("allotted_overs", self.season.overs_per_innings))
-
-        if status == MatchStatus.PLAYED:
-            h_runs = int(kv.get("home_runs", "0"))
-            a_runs = int(kv.get("away_runs", "0"))
-            h_overs = kv.get("home_overs", str(allotted))
-            a_overs = kv.get("away_overs", str(allotted))
-            h_out = _parse_bool(kv.get("home_all_out", "false")) or int(kv.get("home_wickets", "0")) >= 10
-            a_out = _parse_bool(kv.get("away_all_out", "false")) or int(kv.get("away_wickets", "0")) >= 10
-            try:
-                hb = overs_to_balls(h_overs)
-                ab = overs_to_balls(a_overs)
-                if hb > allotted * 6 or ab > allotted * 6:
-                    return f"REJECTED: Overs exceed allotted {allotted} overs for {fix_id}"
-            except ValueError as err:
-                return f"REJECTED: {err}"
-
-            is_tie = h_runs == a_runs
-            winner_id: Optional[str] = None
-            if not is_tie:
-                winner_id = fix.home_team_id if h_runs > a_runs else fix.away_team_id
-
-            fix.status = MatchStatus.PLAYED
-            fix.result = MatchResult(
-                status=MatchStatus.PLAYED,
-                winner_id=winner_id,
-                is_tie=is_tie,
-                home_runs=h_runs,
-                home_overs=h_overs,
-                home_all_out=h_out,
-                away_runs=a_runs,
-                away_overs=a_overs,
-                away_all_out=a_out,
-                allotted_overs=allotted,
-            )
-            return f"RECORDED: {fix_id} PLAYED ({fix.home_team_id} {h_runs}/{h_overs} vs {fix.away_team_id} {a_runs}/{a_overs})"
-
-        if status == MatchStatus.ABANDONED:
-            h_runs = int(kv.get("home_runs", "0"))
-            a_runs = int(kv.get("away_runs", "0"))
-            h_overs = kv.get("home_overs", "0.0")
-            a_overs = kv.get("away_overs", "0.0")
-            h_out = _parse_bool(kv.get("home_all_out", "false"))
-            a_out = _parse_bool(kv.get("away_all_out", "false"))
-            if "play_pct" in kv:
-                play_pct = float(kv["play_pct"])
-            elif "home_overs" in kv or "away_overs" in kv:
-                total_balls = overs_to_balls(h_overs) + overs_to_balls(a_overs)
-                play_pct = (total_balls / (2.0 * allotted * 6.0)) * 100.0
-            else:
-                play_pct = 0.0
-
-            if play_pct < 50.0:
-                fix.status = MatchStatus.ABANDONED
-                fix.result = MatchResult(
-                    status=MatchStatus.ABANDONED,
-                    is_no_result=True,
-                    play_pct=play_pct,
-                    allotted_overs=allotted,
-                )
-                return f"RECORDED: {fix_id} ABANDONED (<50% play: {play_pct:.1f}%) -> NO RESULT"
-
-            winner = kv.get("winner")
-            if winner is not None:
-                if winner not in (fix.home_team_id, fix.away_team_id):
-                    return f"REJECTED: Invalid winner {winner} for {fix_id}"
-                fix.status = MatchStatus.ABANDONED
-                fix.result = MatchResult(
-                    status=MatchStatus.ABANDONED,
-                    winner_id=winner,
-                    home_runs=h_runs,
-                    home_overs=h_overs,
-                    home_all_out=h_out,
-                    away_runs=a_runs,
-                    away_overs=a_overs,
-                    away_all_out=a_out,
-                    allotted_overs=allotted,
-                    play_pct=play_pct,
-                )
-                return f"RECORDED: {fix_id} ABANDONED (>=50% play) -> winner {winner}"
-
-            if h_runs != a_runs:
-                w = fix.home_team_id if h_runs > a_runs else fix.away_team_id
-                fix.status = MatchStatus.ABANDONED
-                fix.result = MatchResult(
-                    status=MatchStatus.ABANDONED,
-                    winner_id=w,
-                    home_runs=h_runs,
-                    home_overs=h_overs,
-                    home_all_out=h_out,
-                    away_runs=a_runs,
-                    away_overs=a_overs,
-                    away_all_out=a_out,
-                    allotted_overs=allotted,
-                    play_pct=play_pct,
-                )
-                return f"RECORDED: {fix_id} ABANDONED (>=50% play) -> winner {w}"
-
-            fix.status = MatchStatus.ABANDONED
-            fix.result = MatchResult(
-                status=MatchStatus.ABANDONED,
-                is_no_result=True,
-                play_pct=play_pct,
-                allotted_overs=allotted,
-            )
-            return f"RECORDED: {fix_id} ABANDONED -> NO RESULT"
-
-        if status == MatchStatus.FORFEIT:
-            winner = kv.get("winner")
-            forfeited_by = kv.get("forfeited_by")
-            if winner is not None:
-                if winner not in (fix.home_team_id, fix.away_team_id):
-                    return f"REJECTED: Invalid winner {winner} for {fix_id}"
-                forfeited_by = fix.away_team_id if winner == fix.home_team_id else fix.home_team_id
-            elif forfeited_by is not None:
-                if forfeited_by not in (fix.home_team_id, fix.away_team_id):
-                    return f"REJECTED: Invalid team {forfeited_by} for {fix_id}"
-                winner = fix.away_team_id if forfeited_by == fix.home_team_id else fix.home_team_id
-            else:
-                return f"REJECTED: FORFEIT requires winner or forfeited_by for {fix_id}"
-
-            fix.status = MatchStatus.FORFEIT
-            fix.result = MatchResult(
-                status=MatchStatus.FORFEIT,
-                winner_id=winner,
-                forfeited_by=forfeited_by,
-            )
-            return f"RECORDED: {fix_id} FORFEIT -> winner {winner} (forfeited by {forfeited_by})"
+            self._reject(result_id, row.fixture_id, f"invalid status {row.status}")
+            return
 
         if status == MatchStatus.POSTPONED:
-            if self.orig_last_round_end is None:
-                return f"REJECTED: Schedule not generated"
-            ok, new_date = reschedule_postponed_fixture(
-                fix,
+            fixture.status = MatchStatus.POSTPONED
+            new_date = reschedule_fixture(
+                fixture,
                 self.fixtures,
-                self.teams,
-                self.venues,
-                self.distances,
-                self.season,
-                self.orig_last_round_end,
+                self.data.teams,
+                self.data.venues,
+                self.data.league_blackouts,
+                self.data.season,
+                self.data.distances,
+                self.last_round_end,
             )
-            if ok and new_date is not None:
-                return f"POSTPONED: {fix_id} rescheduled from {res_date.isoformat()} to {new_date.isoformat()} {fix.start_time}"
-            return f"POSTPONED: {fix_id} cancelled as NO RESULT (no valid slot before reserve cutoff)"
+            if new_date is None:
+                fixture.event_date = self.league_cutoff
+                self.result_log.append(
+                    ResultLogRow(
+                        result_id=result_id,
+                        fixture_id=row.fixture_id,
+                        action="CANCELLED",
+                        reason="no legal slot before the reserve-day cutoff",
+                        new_match_date="",
+                    )
+                )
+                self.outputs.append(f"CANCELLED {result_id}: no legal reschedule slot")
+            else:
+                self.result_log.append(
+                    ResultLogRow(
+                        result_id=result_id,
+                        fixture_id=row.fixture_id,
+                        action="RESCHEDULED",
+                        reason="POSTPONED result required a new date",
+                        new_match_date=new_date.isoformat(),
+                    )
+                )
+                self.outputs.append(f"RESCHEDULED {row.fixture_id} to {new_date}")
+            self._after_possible_result()
+            return
 
-        return f"REJECTED: Unsupported status {status_str}"
-
-    # record penalty
-    def _handle_penalty(self, team_id: str, round_no: int) -> str:
-        if team_id not in self.teams:
-            raise ValueError(f"Unknown team {team_id}")
-        prior = sum(1 for p in self.penalties if p.team_id == team_id)
-        num = prior + 1
-        deduction = 0 if num == 1 else (1 if num == 2 else 2)
-        self.penalties.append(
-            PenaltyOffence(team_id=team_id, round_no=round_no, offence_num=num, deduction=deduction)
+        result = MatchResult(
+            status=status,
+            batting_first=row.batting_first,
+            home_runs=row.home_runs,
+            home_wickets=row.home_wickets,
+            home_overs=row.home_overs,
+            away_runs=row.away_runs,
+            away_wickets=row.away_wickets,
+            away_overs=row.away_overs,
+            play_completed_pct=row.play_completed_pct,
+            allotted_overs=self.data.season.overs_per_innings,
+            forfeited_by=row.forfeiting_team_id or None,
         )
-        return f"PENALTY: {team_id} slow-over-rate offence #{num} in Round {round_no} -> -{deduction} pt(s)"
-
-    # team withdrawal
-    def _handle_withdraw(self, team_id: str) -> str:
-        if team_id not in self.teams:
-            raise ValueError(f"Unknown team {team_id}")
-        team = self.teams[team_id]
-        team_fixes = [f for f in self.fixtures if team_id in (f.home_team_id, f.away_team_id)]
-        played_cnt = sum(
-            1
-            for f in team_fixes
-            if f.status in (MatchStatus.PLAYED, MatchStatus.ABANDONED, MatchStatus.FORFEIT)
-        )
-        total_cnt = len(team_fixes)
-        team.withdrawn = True
-
-        # check 50 percent
-        if played_cnt * 2 < total_cnt:
-            team.expunged = True
-            for f in team_fixes:
-                if f.status in (MatchStatus.PLAYED, MatchStatus.ABANDONED, MatchStatus.FORFEIT):
-                    f.expunged = True
-                else:
-                    f.status = MatchStatus.CANCELLED
-                    f.expunged = True
-            assign_start_times(self.fixtures, self.season)
-            return f"WITHDRAW: {team_id} played {played_cnt}/{total_cnt} (<50%) -> played results expunged, remaining cancelled"
-
-        for f in team_fixes:
-            if f.status in (MatchStatus.SCHEDULED, MatchStatus.POSTPONED):
-                opp_id = f.away_team_id if f.home_team_id == team_id else f.home_team_id
-                f.status = MatchStatus.WALKOVER
-                f.result = MatchResult(status=MatchStatus.WALKOVER, winner_id=opp_id)
-        assign_start_times(self.fixtures, self.season)
-        return f"WITHDRAW: {team_id} played {played_cnt}/{total_cnt} (>=50%) -> results stand, remaining awarded as 2-pt walkovers"
-
-    # playoff result
-    def _handle_playoff_result(self, pos: list[str], kv: dict[str, str]) -> str:
-        if self.bracket is None:
-            standings = compute_standings(self.teams, self.fixtures, self.penalties, None, self.orig_round_end)
-            self.qualifiers, self.bracket = build_playoff_bracket(standings)
-        code = pos[0].upper()
-        status_str = pos[1].upper() if len(pos) > 1 else "PLAYED"
-        status = MatchStatus(status_str)
-        winner = kv.get("winner")
-        is_tie = _parse_bool(kv.get("tie", "false"))
-        is_nr = _parse_bool(kv.get("no_result", "false"))
-        if not is_tie and "home_runs" in kv and "away_runs" in kv:
-            hr = int(kv["home_runs"])
-            ar = int(kv["away_runs"])
-            if hr == ar:
-                is_tie = True
-        pm = record_playoff_outcome(
-            self.bracket, code, status, winner_id=winner, is_tie=is_tie, is_no_result=is_nr
-        )
-        msg = f"PLAYOFF {code}: winner {pm.winner_id}"
-        if pm.note:
-            msg += f" ({pm.note})"
-        return msg
-
-    # format fixtures
-    def format_fixtures(self, round_no: Optional[int] = None, team_id: Optional[str] = None) -> list[str]:
-        rows = list(self.fixtures)
-        if round_no is not None:
-            rows = [f for f in rows if f.round_no == round_no]
-        if team_id is not None:
-            rows = [f for f in rows if team_id in (f.home_team_id, f.away_team_id)]
-        lines = [
-            f"=== FIXTURES ({len(rows)}) ===",
-            f"{'ID':<5} {'RND':<4} {'DATE':<10} {'TIME':<6} {'HOME':<6} {'AWAY':<6} {'VENUE':<6} {'CITY':<12} {'STATUS':<10} {'NOTE'}",
-        ]
-        for f in sorted(rows, key=lambda x: (x.match_date, x.start_time, x.fixture_id)):
-            notes: list[str] = []
-            if f.swapped_from_blackout:
-                notes.append("H/A swapped (blackout)")
-            if f.rescheduled_from is not None:
-                notes.append(f"from {f.rescheduled_from.isoformat()}")
-            if f.expunged:
-                notes.append("EXPUNGED")
-            lines.append(
-                f"{f.fixture_id:<5} R{f.round_no:<3} {f.match_date.isoformat():<10} {f.start_time:<6} "
-                f"{f.home_team_id:<6} {f.away_team_id:<6} {f.venue_id:<6} {f.city:<12} {f.status.value:<10} {', '.join(notes)}"
+        if status == MatchStatus.PLAYED:
+            if overs_to_balls(row.home_overs) > result.allotted_overs * 6:
+                self._reject(result_id, row.fixture_id, "home overs exceed the innings limit")
+                return
+            if overs_to_balls(row.away_overs) > result.allotted_overs * 6:
+                self._reject(result_id, row.fixture_id, "away overs exceed the innings limit")
+                return
+            result.is_tie = row.home_runs == row.away_runs
+            result.winner_id = (
+                None
+                if result.is_tie
+                else fixture.home_team_id
+                if row.home_runs > row.away_runs
+                else fixture.away_team_id
             )
-        return lines
-
-    # format table
-    def format_table(self, up_to_round: Optional[int] = None) -> list[str]:
-        rows = compute_standings(
-            self.teams, self.fixtures, self.penalties, up_to_round=up_to_round, orig_round_end=self.orig_round_end
-        )
-        title = f"=== POINTS TABLE (AFTER ROUND {up_to_round}) ===" if up_to_round is not None else "=== POINTS TABLE ==="
-        lines = [
-            title,
-            f"{'POS':<4} {'ID':<5} {'TEAM':<20} {'P':<3} {'W':<3} {'L':<3} {'T':<3} {'NR':<3} {'FF':<3} {'PEN':<4} {'PTS':<4} {'NRR':>8}  {'NOTE'}",
-        ]
-        for r in rows:
-            tag = "[WITHDRAWN]" if r.withdrawn else ""
-            note = f"{tag} {r.tie_break_note}".strip()
-            lines.append(
-                f"{r.rank:<4} {r.team_id:<5} {r.team_name:<20} {r.played:<3} {r.won:<3} {r.lost:<3} "
-                f"{r.tied:<3} {r.no_result:<3} {r.forfeits:<3} {r.penalty_points:<4} {r.points:<4} {r.nrr:>+8.4f}  {note}"
+        elif status == MatchStatus.ABANDONED:
+            if row.play_completed_pct < 50:
+                result.is_no_result = True
+            else:
+                if row.home_overs == "0.0" or row.away_overs == "0.0":
+                    self._reject(result_id, row.fixture_id, "a completed abandoned match needs score data")
+                    return
+                result.is_tie = row.home_runs == row.away_runs
+                result.winner_id = (
+                    None
+                    if result.is_tie
+                    else fixture.home_team_id
+                    if row.home_runs > row.away_runs
+                    else fixture.away_team_id
+                )
+        elif status == MatchStatus.FORFEIT:
+            if row.forfeiting_team_id not in (fixture.home_team_id, fixture.away_team_id):
+                self._reject(result_id, row.fixture_id, "forfeiting team does not play in this fixture")
+                return
+            result.winner_id = (
+                fixture.away_team_id
+                if row.forfeiting_team_id == fixture.home_team_id
+                else fixture.home_team_id
             )
-        return lines
-
-    # format playoffs
-    def format_qualification(self) -> list[str]:
-        standings = compute_standings(self.teams, self.fixtures, self.penalties, None, self.orig_round_end)
-        if self.bracket is None:
-            self.qualifiers, self.bracket = build_playoff_bracket(standings)
         else:
-            active = [row for row in standings if not row.withdrawn]
-            self.qualifiers = active[:4]
+            self._reject(result_id, row.fixture_id, f"unsupported result status {status.value}")
+            return
 
-        lines = ["=== QUALIFICATION REPORT ===", "Top 4 Qualifiers:"]
-        for seed, row in enumerate(self.qualifiers, start=1):
-            note = f" [{row.tie_break_note}]" if row.tie_break_note else ""
-            lines.append(
-                f"  Seed #{seed}: {row.team_id} ({row.team_name}) | Pts: {row.points} | W: {row.won} | NRR: {row.nrr:+.4f}{note}"
+        fixture.status = status
+        fixture.result = result
+        fixture.event_date = row.match_date
+        self.result_log.append(
+            ResultLogRow(
+                result_id=result_id,
+                fixture_id=row.fixture_id,
+                action="RECORDED",
+                reason=status.value,
+                new_match_date="",
             )
-        lines.append("Playoff Bracket:")
-        for code in ("Q1", "ELIM", "Q2", "FINAL"):
-            pm = self.bracket[code]
-            t1 = f"{pm.team1_id}(#{pm.team1_seed})" if pm.team1_id else "TBD"
-            t2 = f"{pm.team2_id}(#{pm.team2_seed})" if pm.team2_id else "TBD"
-            res = f" -> Winner: {pm.winner_id}" if pm.winner_id else " (Scheduled)"
-            extra = f" [{pm.note}]" if pm.note else ""
-            lines.append(f"  {pm.label:<12}: {t1} vs {t2}{res}{extra}")
-        final_pm = self.bracket["FINAL"]
-        if final_pm.winner_id:
-            lines.append(f"Champion: {final_pm.winner_id} ({self.teams[final_pm.winner_id].name})")
-        return lines
+        )
+        self.outputs.append(f"RECORDED {result_id}: {status.value}")
+        self._after_possible_result()
+
+    def _after_possible_result(self) -> None:
+        if self.closed and self.bracket is not None:
+            self._refresh_final_outputs()
+        self._write_result_log()
+
+    def _record_offence(self, offence_id: str) -> None:
+        offence = self.data.offences.get(offence_id)
+        if offence is None:
+            raise ValueError(f"unknown offence {offence_id}")
+        fixture = self.fixtures_by_id.get(offence.fixture_id)
+        if fixture is None:
+            raise ValueError(f"offence {offence_id} refers to unknown fixture")
+        previous = sum(1 for item in self.penalties if item.team_id == offence.team_id)
+        deduction = 0 if previous == 0 else 1 if previous == 1 else 2
+        self.penalties.append(
+            Penalty(
+                offence_id=offence_id,
+                team_id=offence.team_id,
+                round_no=fixture.round_no,
+                match_date=offence.match_date,
+                deduction=deduction,
+            )
+        )
+        self.outputs.append(
+            f"OFFENCE {offence_id}: {offence.team_id} offence {previous + 1}, deduction {deduction}"
+        )
+        if self.closed:
+            self._refresh_final_outputs()
+
+    def _withdraw(self, team_id: str, withdrawal_date: date) -> None:
+        team = self.data.teams.get(team_id)
+        if team is None:
+            raise ValueError(f"unknown team {team_id}")
+        if team.withdrawn_on is not None:
+            raise ValueError(f"team {team_id} has already withdrawn")
+        team_fixtures = [
+            fixture
+            for fixture in self.fixtures
+            if team_id in (fixture.home_team_id, fixture.away_team_id)
+        ]
+        played = sum(
+            1
+            for fixture in team_fixtures
+            if fixture.status in (MatchStatus.PLAYED, MatchStatus.ABANDONED, MatchStatus.FORFEIT)
+            and (fixture.event_date or fixture.match_date) <= withdrawal_date
+        )
+        total = len(team_fixtures)
+        expunged = played * 2 < total
+        team.withdrawn_on = withdrawal_date
+        team.expunged = expunged
+        if expunged:
+            for fixture in team_fixtures:
+                fixture.expunged = True
+                if fixture.status == MatchStatus.SCHEDULED:
+                    fixture.status = MatchStatus.CANCELLED
+                    fixture.result = MatchResult(MatchStatus.CANCELLED, is_no_result=True)
+        else:
+            for fixture in team_fixtures:
+                if fixture.status in (MatchStatus.SCHEDULED, MatchStatus.POSTPONED):
+                    opponent = (
+                        fixture.away_team_id
+                        if fixture.home_team_id == team_id
+                        else fixture.home_team_id
+                    )
+                    fixture.status = MatchStatus.WALKOVER
+                    fixture.result = MatchResult(MatchStatus.WALKOVER, winner_id=opponent)
+                    fixture.event_date = withdrawal_date
+        self.withdrawals.append(
+            Withdrawal(team_id, withdrawal_date, played, total, expunged)
+        )
+        self.outputs.append(
+            f"WITHDRAWN {team_id}: {played}/{total}, {'expunged' if expunged else 'walkovers'}"
+        )
+        if self.closed:
+            self._refresh_final_outputs()
+
+    def _table_for_round(self, round_no: int) -> list[Standing]:
+        if round_no not in self.round_end:
+            raise ValueError(f"round {round_no} is not present")
+        return compute_standings(
+            self.data.teams,
+            self.fixtures,
+            self.penalties,
+            up_to_round=round_no,
+            round_end=self.round_end[round_no],
+        )
+
+    def _print_table(self, round_no: int) -> None:
+        table = self._table_for_round(round_no)
+        path = self.output_dir / f"points_table_r{round_no:02d}.csv"
+        write_points_table(path, table)
+        self.outputs.append(f"POINTS TABLE ROUND {round_no}")
+        for row in table:
+            self.outputs.append(
+                f"{row.position:>2}. {row.team_id:<7} {row.points:>3} pts  {row.nrr:+.4f}"
+            )
+
+    def _close_league(self) -> None:
+        self.closed = True
+        self._refresh_final_outputs()
+        self.outputs.append("LEAGUE STAGE CLOSED")
+
+    def _refresh_final_outputs(self) -> None:
+        table = compute_standings(self.data.teams, self.fixtures, self.penalties)
+        self.final_table = table
+        final_round = max(self.round_end)
+        write_points_table(
+            self.output_dir / f"points_table_r{final_round:02d}.csv", table
+        )
+        eliminated = {
+            team_id for team_id, team in self.data.teams.items() if team.withdrawn_on
+        }
+        self.bracket = build_bracket(table, eliminated)
+        rows = qualification_rows(table, eliminated)
+        write_qualification(self.output_dir / "qualification.csv", rows)
+
+    def _print_qualification(self) -> None:
+        eliminated = {
+            team_id for team_id, team in self.data.teams.items() if team.withdrawn_on
+        }
+        if self.bracket is None:
+            self.final_table = compute_standings(
+                self.data.teams, self.fixtures, self.penalties
+            )
+            self.bracket = build_bracket(self.final_table, eliminated)
+            write_qualification(
+                self.output_dir / "qualification.csv",
+                qualification_rows(self.final_table, eliminated),
+            )
+        active = [row for row in self.final_table if row.team_id not in eliminated][:4]
+        self.outputs.append("QUALIFICATION")
+        self.outputs.extend(f"{row.position}. {row.team_id}" for row in active)
+        self.outputs.extend(bracket_lines(self.bracket))
+
+    def _record_playoff_result(self, args: list[str]) -> None:
+        if self.bracket is None:
+            self._close_league()
+        if self.bracket is None:
+            raise ValueError("playoff bracket is not available")
+        code = args[0]
+        winner = args[1] if len(args) > 1 and args[1] else None
+        tied = len(args) > 2 and args[2].lower() == "true"
+        match = record_playoff_result(self.bracket, code, winner, tied)
+        self.outputs.append(f"PLAYOFF {match.label}: {match.winner_id} won")
+
+    def _print_fixtures(self, round_text: str | None) -> None:
+        fixtures = self.fixtures
+        if round_text:
+            round_no = int(round_text)
+            fixtures = [item for item in fixtures if item.round_no == round_no]
+        write_fixtures(self.output_dir / "fixtures.csv", fixtures)
+        self.outputs.append(f"FIXTURES ({len(fixtures)})")
+        for fixture in fixtures:
+            self.outputs.append(
+                f"{fixture.fixture_id} R{fixture.round_no} {fixture.match_date} "
+                f"{fixture.home_team_id} v {fixture.away_team_id} "
+                f"{fixture.venue_id} {fixture.status.value}"
+            )
+
+    def _write_result_log(self) -> None:
+        write_result_log(self.output_dir / "result_log.csv", self.result_log)

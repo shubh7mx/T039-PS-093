@@ -1,0 +1,11 @@
+blackout_id,scope,venue_id,date,reason
+BO-01,LEAGUE,,2026-09-19,Festival holiday
+BO-02,LEAGUE,,2026-09-27,National holiday
+BO-03,LEAGUE,,2026-10-02,National holiday
+BO-04,LEAGUE,,2026-10-10,National holiday
+BO-05,LEAGUE,,2026-10-20,Broadcaster blackout
+BO-06,LEAGUE,,2026-10-30,State election
+BO-07,VENUE,VEN-01,2026-10-09,Venue booked for concert
+BO-08,VENUE,VEN-01,2026-10-10,Venue booked for concert
+BO-09,VENUE,VEN-02,2026-10-09,Venue booked for concert
+BO-10,VENUE,VEN-02,2026-10-10,Venue booked for concert

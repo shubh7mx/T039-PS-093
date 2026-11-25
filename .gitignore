@@ -4,5 +4,17 @@ dist/
 coverage/
 .DS_Store
 *.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated league outputs
+/output/
+/generated_fixtures.csv
+/fixtures.csv
+/result_log.csv
+/points_table_r*.csv
+/qualification.csv
+
 .env*
 !.env.example

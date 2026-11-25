@@ -1,91 +1,111 @@
-from typing import Optional
-from data_types import MatchStatus, PlayoffMatch, StandingsRow
+"""Top-four qualification and playoff bracket progression."""
+
+from __future__ import annotations
+
+from datetime import date
+
+from models import PlayoffMatch, Standing
 
 
-# seed qualifiers
-def build_playoff_bracket(standings: list[StandingsRow]) -> tuple[list[StandingsRow], dict[str, PlayoffMatch]]:
-    active = [row for row in standings if not row.withdrawn]
-    qualifiers = active[:4]
-    if len(qualifiers) < 4:
-        raise ValueError("Need at least 4 active teams for playoffs")
-
-    q1 = PlayoffMatch(
-        code="Q1",
-        label="Qualifier 1",
-        team1_id=qualifiers[0].team_id,
-        team1_seed=1,
-        team2_id=qualifiers[1].team_id,
-        team2_seed=2,
-    )
-    elim = PlayoffMatch(
-        code="ELIM",
-        label="Eliminator",
-        team1_id=qualifiers[2].team_id,
-        team1_seed=3,
-        team2_id=qualifiers[3].team_id,
-        team2_seed=4,
-    )
-    q2 = PlayoffMatch(
-        code="Q2",
-        label="Qualifier 2",
-    )
-    final = PlayoffMatch(
-        code="FINAL",
-        label="Final",
-    )
-    bracket = {"Q1": q1, "ELIM": elim, "Q2": q2, "FINAL": final}
-    return qualifiers, bracket
+def build_bracket(standings: list[Standing], eliminated: set[str]) -> dict[str, PlayoffMatch]:
+    active = [row for row in standings if row.team_id not in eliminated]
+    if len(active) < 4:
+        raise ValueError("At least four active teams are required for playoffs")
+    return {
+        "Q1": PlayoffMatch(
+            code="Q1",
+            label="Qualifier 1",
+            seed1=1,
+            team1_id=active[0].team_id,
+            seed2=2,
+            team2_id=active[1].team_id,
+        ),
+        "ELIM": PlayoffMatch(
+            code="ELIM",
+            label="Eliminator",
+            seed1=3,
+            team1_id=active[2].team_id,
+            seed2=4,
+            team2_id=active[3].team_id,
+        ),
+        "Q2": PlayoffMatch(code="Q2", label="Qualifier 2"),
+        "FINAL": PlayoffMatch(code="FINAL", label="Final"),
+    }
 
 
-# playoff result
-def record_playoff_outcome(
+def record_playoff_result(
     bracket: dict[str, PlayoffMatch],
     code: str,
-    status: MatchStatus,
-    winner_id: Optional[str] = None,
-    is_tie: bool = False,
-    is_no_result: bool = False,
+    winner_id: str | None,
+    tied: bool,
 ) -> PlayoffMatch:
-    if code not in bracket:
-        raise ValueError(f"Unknown playoff match: {code}")
-    pm = bracket[code]
-    if pm.team1_id is None or pm.team2_id is None:
-        raise ValueError(f"Teams not yet determined for {code}")
-    if pm.status != MatchStatus.SCHEDULED:
-        raise ValueError(f"Playoff match {code} already decided")
-    if pm.team1_seed is None or pm.team2_seed is None:
-        raise ValueError(f"Missing seed for {code}")
+    match = bracket.get(code.upper())
+    if match is None:
+        raise ValueError(f"Unknown playoff match {code}")
+    if match.team1_id is None or match.team2_id is None:
+        raise ValueError(f"Teams are not yet known for {match.label}")
+    if match.winner_id is not None:
+        raise ValueError(f"{match.label} already has a result")
 
-    if is_tie or is_no_result or (status == MatchStatus.ABANDONED and winner_id is None):
-        # higher seed wins
-        if pm.team1_seed < pm.team2_seed:
-            w_id, l_id = pm.team1_id, pm.team2_id
-            w_seed = pm.team1_seed
+    if tied or winner_id is None:
+        winner_id = (
+            match.team1_id
+            if (match.seed1 or 99) < (match.seed2 or 99)
+            else match.team2_id
+        )
+        match.note = "Higher league position wins the tie"
+    if winner_id not in (match.team1_id, match.team2_id):
+        raise ValueError(f"Invalid winner {winner_id} for {match.label}")
+
+    match.winner_id = winner_id
+    match.loser_id = match.team2_id if winner_id == match.team1_id else match.team1_id
+    winning_seed = match.seed1 if winner_id == match.team1_id else match.seed2
+    losing_seed = match.seed2 if winner_id == match.team1_id else match.seed1
+    if code.upper() == "Q1":
+        bracket["FINAL"].team1_id = winner_id
+        bracket["FINAL"].seed1 = winning_seed
+        bracket["Q2"].team1_id = match.loser_id
+        bracket["Q2"].seed1 = losing_seed
+    elif code.upper() == "ELIM":
+        bracket["Q2"].team2_id = winner_id
+        bracket["Q2"].seed2 = winning_seed
+    elif code.upper() == "Q2":
+        bracket["FINAL"].team2_id = winner_id
+        bracket["FINAL"].seed2 = winning_seed
+    return match
+
+
+def qualification_rows(
+    standings: list[Standing], eliminated: set[str]
+) -> list[dict[str, object]]:
+    active = [row for row in standings if row.team_id not in eliminated][:4]
+    rows: list[dict[str, object]] = []
+    for index, row in enumerate(active):
+        if index < 2:
+            match_name = "Qualifier 1"
+            opponent = active[1] if index == 0 else active[0]
         else:
-            w_id, l_id = pm.team2_id, pm.team1_id
-            w_seed = pm.team2_seed
-        pm.winner_id = w_id
-        pm.loser_id = l_id
-        pm.status = status
-        pm.note = f"Tie/NR decided by higher league position (Seed #{w_seed})"
-    else:
-        if winner_id not in (pm.team1_id, pm.team2_id):
-            raise ValueError(f"Invalid winner {winner_id} for {code}")
-        pm.winner_id = winner_id
-        pm.loser_id = pm.team2_id if winner_id == pm.team1_id else pm.team1_id
-        pm.status = status
+            match_name = "Eliminator"
+            opponent = active[3] if index == 2 else active[2]
+        rows.append(
+            {
+                "position": index + 1,
+                "team_id": row.team_id,
+                "points": row.points,
+                "nrr": f"{row.nrr:.4f}",
+                "playoff_match": match_name,
+                "opponent": opponent.team_id,
+            }
+        )
+    return rows
 
-    # advance winner
-    seed_map = {pm.team1_id: pm.team1_seed, pm.team2_id: pm.team2_seed}
-    if code == "Q1":
-        bracket["FINAL"].team1_id = pm.winner_id
-        bracket["FINAL"].team1_seed = seed_map[pm.winner_id]
-        bracket["Q2"].team1_id = pm.loser_id
-        bracket["Q2"].team1_seed = seed_map[pm.loser_id]
-    elif code == "ELIM":
-        bracket["Q2"].team2_id = pm.winner_id
-        bracket["Q2"].team2_seed = seed_map[pm.winner_id]
-    elif code == "Q2":
-        bracket["FINAL"].team2_id = pm.winner_id
-        bracket["FINAL"].team2_seed = seed_map[pm.winner_id]
-    return pm
+
+def bracket_lines(bracket: dict[str, PlayoffMatch]) -> list[str]:
+    lines = ["Playoff bracket:"]
+    for code in ("Q1", "ELIM", "Q2", "FINAL"):
+        match = bracket[code]
+        team1 = match.team1_id or "TBD"
+        team2 = match.team2_id or "TBD"
+        suffix = f" -> {match.winner_id}" if match.winner_id else ""
+        lines.append(f"  {match.label}: {team1} vs {team2}{suffix}")
+    return lines
