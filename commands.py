@@ -35,6 +35,7 @@ class LeagueEngine:
         self.result_log: list[ResultLogRow] = []
         self.bracket: dict[str, PlayoffMatch] | None = None
         self.final_table: list[Standing] = []
+        self.table_snapshots: dict[int, list[Standing]] = {}
         self.closed = False
         self.outputs: list[str] = []
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -397,6 +398,7 @@ class LeagueEngine:
 
     def _print_table(self, round_no: int) -> None:
         table = self._table_for_round(round_no)
+        self.table_snapshots[round_no] = table
         path = self.output_dir / f"points_table_r{round_no:02d}.csv"
         write_points_table(path, table)
         self.outputs.append(f"POINTS TABLE ROUND {round_no}")
@@ -414,6 +416,7 @@ class LeagueEngine:
         table = compute_standings(self.data.teams, self.fixtures, self.penalties)
         self.final_table = table
         final_round = max(self.round_end)
+        self.table_snapshots[final_round] = table
         write_points_table(
             self.output_dir / f"points_table_r{final_round:02d}.csv", table
         )

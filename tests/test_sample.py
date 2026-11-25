@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 from commands import LeagueEngine
+from console import render_report
 from loaders import load_data
 from models import MatchResult, MatchStatus
 from playoffs import build_bracket, record_playoff_result
@@ -154,6 +155,24 @@ class SampleTests(unittest.TestCase):
             with (Path(self.temp_dir.name) / filename).open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), count, filename)
+
+    def test_console_report_is_complete_and_readable(self) -> None:
+        report = render_report(self.engine, colour_enabled=False)
+        self.assertIn("PS-093  LEAGUE COMPETITION ENGINE", report)
+        self.assertIn("Team T039  |  Section CSDS B", report)
+        self.assertIn("1. RUN OVERVIEW", report)
+        self.assertIn("2. REQUESTED POINT TABLES", report)
+        self.assertIn("After round 6", report)
+        self.assertIn("After round 12", report)
+        self.assertIn("Final table", report)
+        self.assertIn("3. QUALIFICATION AND PLAYOFFS", report)
+        self.assertIn("4. COMPLETE FIXTURE LIST", report)
+        self.assertIn("OUTPUT FILES", report)
+        self.assertIn("T05-DEL", report)
+        self.assertEqual(
+            sum(line.startswith("  FX-") for line in report.splitlines()), 90
+        )
+        self.assertNotIn("\033[", report)
 
 
 if __name__ == "__main__":

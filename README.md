@@ -6,7 +6,7 @@ A small command-file driven engine for double round-robin fixtures, results, poi
 
 | Team ID | Member 1 | Member 2 | Section |
 |---|---|---|---|
-| T039 | SHUBHAM KUMAR SINGH – CD079 | SIDHANT RAJESH BIRADAR – CD080 | CSDS B |
+| T039 | SHUBHAM KUMAR SINGH – 1AT24CD079 | SIDHANT RAJESH BIRADAR – 1AT24CD080 | CSDS B |
 
 ## Run
 
@@ -26,11 +26,14 @@ Run the tests:
 python -m unittest discover -v
 ```
 
+The terminal prints the complete requested output: scheduling warnings, processing totals, round 6/12/18 tables, qualification and bracket, and all 90 fixtures. Detailed command history remains available in `result_log.csv`.
+
 ## Files
 
 | File | Responsibility |
 |---|---|
 | `main.py` | CLI entry point |
+| `console.py` | Formats the complete terminal report |
 | `commands.py` | Processes commands in file order and owns league state |
 | `loaders.py` | Reads sample CSVs and writes output CSVs |
 | `models.py` | Small dataclasses and status enums |
@@ -38,7 +41,6 @@ python -m unittest discover -v
 | `standings.py` | Points, NRR, penalties, and tie-breakers |
 | `playoffs.py` | Top-four qualification and playoff progression |
 | `docs/design.md` | Business rules BR-01 through BR-18 |
-| `tasks/plan.md` | Scope, architecture, risks, and completion criteria |
 
 ## Outputs
 

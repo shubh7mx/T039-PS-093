@@ -493,12 +493,34 @@ def audit_fixtures(
             last_day = max(item.match_date for item in round_fixtures)
         played_days = {item.match_date for item in round_fixtures}
         cursor = first_day
+        checked_weekends: set[date] = set()
         while cursor <= last_day:
-            if cursor.weekday() >= 5 and cursor not in played_days:
-                reason = "league blackout" if cursor in league_blackouts else "no legal match"
-                issues.append(
-                    f"UNSATISFIED CONSTRAINT: round {round_no} has no match on weekend {cursor} ({reason})"
-                )
+            if cursor.weekday() >= 5:
+                saturday = cursor - timedelta(days=cursor.weekday() - 5)
+            else:
+                saturday = None
+            if saturday is not None and saturday not in checked_weekends:
+                checked_weekends.add(saturday)
+                sunday = saturday + timedelta(days=1)
+                weekend_days = [
+                    day
+                    for day in (saturday, sunday)
+                    if first_day <= day <= last_day
+                ]
+                if weekend_days and not any(day in played_days for day in weekend_days):
+                    label = (
+                        weekend_days[0].isoformat()
+                        if len(weekend_days) == 1
+                        else f"{weekend_days[0]}..{weekend_days[-1]}"
+                    )
+                    reason = (
+                        "league blackout"
+                        if all(day in league_blackouts for day in weekend_days)
+                        else "no legal match"
+                    )
+                    issues.append(
+                        f"UNSATISFIED CONSTRAINT: round {round_no} has no match on weekend {label} ({reason})"
+                    )
             cursor += timedelta(days=1)
     return list(dict.fromkeys(issues))
 
