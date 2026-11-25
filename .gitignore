@@ -8,6 +8,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 /tasks/
+/videos/
+/.uv-cache/
+/.analysis_output/
 
 # Generated league outputs
 /output/

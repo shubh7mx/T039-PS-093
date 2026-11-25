@@ -41,6 +41,22 @@ The terminal prints the complete requested output: scheduling warnings, processi
 | `standings.py` | Points, NRR, penalties, and tie-breakers |
 | `playoffs.py` | Top-four qualification and playoff progression |
 | `docs/design.md` | Business rules BR-01 through BR-18 |
+| `docs/T039_PS-093_Design_Document.pdf` | Final submission design document |
+| `scripts/generate_design_pdf.py` | Reproducible PDF report generator |
+
+## Explainer Video
+
+A five-minute 1080p project walkthrough is produced with Explainroo. Its narration, scene descriptions, and visual scenes are stored in `videos/capstone-explainer/`.
+
+Regenerate or preview the video with:
+
+```powershell
+npx --yes explainroo check videos/capstone-explainer
+npx --yes explainroo render videos/capstone-explainer
+npx --yes explainroo verify videos/capstone-explainer
+```
+
+The generated video, subtitles, chapters, contact sheet, and cover image are written to `videos/capstone-explainer/out/`. Generated media is ignored by Git.
 
 ## Outputs
 
